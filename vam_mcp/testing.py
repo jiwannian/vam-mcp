@@ -133,7 +133,7 @@ yield break;
             raise
 
 
-ALLOWED_TEST_OPERATIONS = {"status", "scene", "atom", "plugin", "storable", "morph", "ui_tree", "ui_action", "file_dialog", "capture", "logs"}
+ALLOWED_TEST_OPERATIONS = {"status", "scene", "atom", "plugin", "bepinex", "storable", "morph", "ui_tree", "ui_action", "file_dialog", "capture", "logs"}
 
 
 def run_test(client: BridgeClient, spec: dict, timeout_s=600, cancel_event=None, progress=None):

@@ -79,6 +79,44 @@ def test_real_versions_and_parameters(live):
         param(live, "choice", "absent", "set")
 
 
+def test_bepinex_registry_exposes_loaded_bridge(live):
+    result = live["client"].call("bepinex")
+    assert any(plugin["guid"] == "codex.vam.mcp" for plugin in result["plugins"])
+
+
+def test_bepinex_deploy_restart_and_verify():
+    from vam_mcp.instances import launch, restart, stop
+    from vam_mcp.build import rollback_deployment
+
+    prerequisites = [
+        GAME / "VaM.exe",
+        GAME / "BepInEx/core/BepInEx.dll",
+        GAME / "BepInEx/core/0Harmony.dll",
+    ]
+    if not all(path.is_file() for path in prerequisites) or not any(instance["connected"] for instance in instances(include_offline=False)):
+        pytest.skip("Live BepInEx workflow requires a configured game and an active bridge-enabled instance")
+
+    instance_id = None
+    deployment_id = None
+    try:
+        instance_id = launch(timeout_s=240)["instance_id"]
+        deployed = deploy_plugin(str(ROOT / "examples/BepInExFixture.cs"), "VaMMcpLiveFixture", profile="bepinex", debug=True)
+        deployment_id = deployed["deployment_id"]
+        restart(instance_id, timeout_s=240)
+        client = get_client(instance_id)
+        plugins = client.call("bepinex")["plugins"]
+        assert any(plugin["guid"] == "codex.vam.mcp.fixture" for plugin in plugins)
+        logs = client.call("logs", {"contains": "VaM MCP BepInEx fixture loaded", "limit": 20})["items"]
+        assert logs
+    finally:
+        if deployment_id:
+            rollback_deployment(deployment_id)
+            if instance_id:
+                restart(instance_id, timeout_s=240)
+        if instance_id:
+            stop(instance_id)
+
+
 def test_ui_controls_and_input_callbacks(live):
     c = live["client"]
     opened = c.call("plugin", {"action": "open_ui", "atom_uid": live["atom_uid"], "plugin_uid": live["plugin_uid"]})
@@ -265,7 +303,7 @@ def test_mcp_stdio_handshake_and_image(live):
                 init = await session.initialize()
                 assert init.serverInfo.name == "VaM"
                 tools = await session.list_tools()
-                assert len(tools.tools) == 17
+                assert len(tools.tools) == 18
                 status = await session.call_tool("vam_status", {"instance_id": live["client"].instance_id})
                 assert not status.isError
                 data = status.structuredContent or json.loads(status.content[0].text)

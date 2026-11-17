@@ -1,10 +1,8 @@
 # Validation
 
-The implementation was exercised against VaM 1.22.0.3, Unity 2018.1.9f1, BepInEx 5.0.1, Python 3.10, and MCP SDK 1.28.1 on Windows.
+The bridge and BepInEx fixture were compiled locally against VaM's CLR references and BepInEx. A real test instance loaded the fixture after restart; the Chainloader registry exposed its GUID and the bridge captured its startup log. The fixture deployment was rolled back and the test instance stopped. The API indexer also queried the installed `BepInEx.dll` successfully.
 
-The final local run passed **44 tests** (29 host-side and 15 live-game tests), with zero failures or skips. Coverage includes the stdio MCP handshake and all 17 tool schemas, compilation against the game's CLR 2.0 assemblies, plugin deployment/reload, parameters and UI callbacks, native file dialogs, screenshots and camera renders, logs, Morph access, C# diagnostics, async cancellation, scene/atom cleanup, multi-instance selection, API indexing, and reconnect after the MCP host exits.
-
-The `examples/smoke.json` workflow was also executed through the MCP server against a live game. It deployed and loaded the fixture plugin, called an action, asserted a parameter, captured the UI, unloaded the plugin, and removed the temporary atom.
+Current host-only validation passed **43 tests**, with 17 live tests deselected. With the VaM root configured, the host/API run passed **44 tests** and skipped 16 live tests when no bridge-enabled instance is active. The live suite now includes the successfully exercised BepInEx DLL/PDB deployment, restart, Chainloader GUID and startup-log verification, rollback, and cleanup workflow. Other coverage includes MCP tool schemas, profile prerequisite discovery, source and asset deployment, prebuilt VAR inspection and load routing, path escape rejection, conflict-checked rollback, compiler reference flags, restart identity handling, API indexer hash invalidation, and installed assembly path validation.
 
 To run host tests:
 

@@ -73,11 +73,200 @@ def test_deployment_preserves_other_files_and_records_backup(tmp_path, monkeypat
     (target / "Plugin.cs").write_text("old source")
     (target / "Other.cs").write_text("unrelated")
     monkeypatch.setattr(build, "RUNTIME", runtime)
-    monkeypatch.setattr(build, "build_plugin", lambda *args: {"ok": True})
+    monkeypatch.setattr(build, "build_plugin", lambda *args, **kwargs: {"ok": True})
     result = build.deploy_plugin(str(source / "Plugin.cs"), "Example", game=game)
     assert (target / "Plugin.cs").read_text() == "new source"
     assert (target / "Other.cs").read_text() == "unrelated"
     assert (runtime / "deployments" / result["deployment_id"] / "previous/Plugin.cs").read_text() == "old source"
+
+
+def test_deployment_manifest_copies_assets_and_supports_conflict_checked_rollback(tmp_path, monkeypatch):
+    source, game, runtime = tmp_path / "src", tmp_path / "game", tmp_path / "runtime"
+    (source / "assets").mkdir(parents=True)
+    (source / "Plugin.cs").write_text("new source")
+    (source / "assets/settings.json").write_text("{}")
+    target = game / "Custom/Scripts/Example"
+    target.mkdir(parents=True)
+    (target / "Plugin.cs").write_text("old source")
+    monkeypatch.setattr(build, "RUNTIME", runtime)
+    monkeypatch.setattr(build, "build_plugin", lambda *args, **kwargs: {"ok": True})
+    result = build.deploy_plugin(str(source / "Plugin.cs"), "Example", artifact_files=["assets/settings.json"], game=game)
+    assert (target / "assets/settings.json").read_text() == "{}"
+    assert build.rollback_deployment(result["deployment_id"], game=game)["rolled_back"] is True
+    assert (target / "Plugin.cs").read_text() == "old source"
+    assert not (target / "assets/settings.json").exists()
+
+
+def test_rollback_refuses_files_changed_after_deployment(tmp_path, monkeypatch):
+    source, game, runtime = tmp_path / "src", tmp_path / "game", tmp_path / "runtime"
+    source.mkdir()
+    game.mkdir()
+    (source / "Plugin.cs").write_text("new source")
+    monkeypatch.setattr(build, "RUNTIME", runtime)
+    monkeypatch.setattr(build, "build_plugin", lambda *args, **kwargs: {"ok": True})
+    result = build.deploy_plugin(str(source / "Plugin.cs"), "Example", game=game)
+    target = game / "Custom/Scripts/Example/Plugin.cs"
+    target.write_text("changed later")
+    with pytest.raises(VamError) as error:
+        build.rollback_deployment(result["deployment_id"], game=game)
+    assert error.value.code == "deployment_conflict"
+    assert target.read_text() == "changed later"
+
+
+def test_deployment_rejects_target_junction_escape(tmp_path, monkeypatch):
+    source, game, outside, runtime = tmp_path / "src", tmp_path / "game", tmp_path / "outside", tmp_path / "runtime"
+    source.mkdir()
+    outside.mkdir()
+    (source / "Plugin.cs").write_text("class Plugin {}")
+    (game / "Custom/Scripts").mkdir(parents=True)
+    try:
+        (game / "Custom/Scripts/Escape").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    monkeypatch.setattr(build, "RUNTIME", runtime)
+    monkeypatch.setattr(build, "build_plugin", lambda *args, **kwargs: {"ok": True})
+    with pytest.raises(VamError) as error:
+        build.deploy_plugin(str(source / "Plugin.cs"), "Escape", game=game)
+    assert error.value.code == "invalid_path"
+
+
+def test_bepinex_profile_deploys_dll_symbols_and_dependencies_with_rollback(tmp_path, monkeypatch):
+    source, game, runtime = tmp_path / "src", tmp_path / "game", tmp_path / "runtime"
+    (source / "config").mkdir(parents=True)
+    game.mkdir()
+    (source / "Plugin.cs").write_text("class Plugin {}")
+    (source / "config/plugin.json").write_text("{}")
+    output = tmp_path / "build/Example.dll"
+    symbols = output.with_suffix(".pdb")
+
+    def fake_build(*args, **kwargs):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"dll")
+        symbols.write_bytes(b"symbols")
+        return {"ok": True, "output": str(output), "symbols": str(symbols)}
+
+    monkeypatch.setattr(build, "RUNTIME", runtime)
+    monkeypatch.setattr(build, "build_plugin", fake_build)
+    result = build.deploy_plugin(str(source / "Plugin.cs"), "Example", profile="bepinex", debug=True, artifact_files=["config/plugin.json"], game=game)
+    target = game / "BepInEx/plugins/Example"
+    assert (target / "Example.dll").read_bytes() == b"dll"
+    assert (target / "Example.pdb").read_bytes() == b"symbols"
+    assert (target / "config/plugin.json").read_text() == "{}"
+    assert build.rollback_deployment(result["deployment_id"], game=game)["rolled_back"] is True
+    assert not (target / "Example.dll").exists()
+    assert not (target / "Example.pdb").exists()
+    assert not (target / "config/plugin.json").exists()
+
+
+def test_var_bundle_validates_and_deploys_prebuilt_archive(tmp_path, monkeypatch):
+    import zipfile
+    source, game, runtime = tmp_path / "Fixture.var", tmp_path / "game", tmp_path / "runtime"
+    game.mkdir()
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("meta.json", '{"creator":"Example","packageName":"Fixture","version":"1"}')
+        archive.writestr("Custom/Scripts/Plugin.cs", "class Plugin {}")
+        archive.writestr("Custom/Scripts/Extra/Helper.cs", "class Helper {}")
+    monkeypatch.setattr(build, "RUNTIME", runtime)
+    result = build.deploy_plugin(str(source), "Fixture.var", profile="var_bundle", game=game)
+    installed = game / "AddonPackages/Fixture.var"
+    assert installed.read_bytes() == source.read_bytes()
+    assert result["compile"]["archive_members"] == 3
+    assert result["entrypoint"] == "AddonPackages/Fixture:/Custom/Scripts/Extra/Helper.cs"
+    assert len(result["plugin_entrypoints"]) == 2
+    assert build.rollback_deployment(result["deployment_id"], game=game)["rolled_back"] is True
+    assert not installed.exists()
+
+
+def test_var_bundle_load_uses_packaged_script_entrypoint(monkeypatch):
+    from vam_mcp import server
+    calls = []
+
+    def game_call(instance_id, operation, arguments, timeout_s=30, write=False):
+        return lambda: calls.append((instance_id, operation, arguments, write)) or {"ok": True}
+
+    monkeypatch.setattr(server, "game_call", game_call)
+    result = asyncio.run(server.vam_plugin(action="load", profile="var_bundle", instance_id="fixture", entrypoint="AddonPackages/Fixture:/Custom/Scripts/Plugin.cs"))
+    assert result["ok"] is True
+    assert calls[0][1] == "plugin" and calls[0][2]["entrypoint"] == "AddonPackages/Fixture:/Custom/Scripts/Plugin.cs"
+    assert calls[0][3] is True
+
+
+def test_compile_profiles_apply_bepinex_references_and_debug_flags(tmp_path, monkeypatch):
+    source, game = tmp_path / "Plugin.cs", tmp_path / "game"
+    source.write_text("class Plugin {}")
+    compiler = tmp_path / "csc.exe"
+    compiler.write_bytes(b"compiler")
+    dep = tmp_path / "dep.dll"
+    dep.write_bytes(b"dep")
+    (game / "BepInEx/core").mkdir(parents=True)
+    for name in ("BepInEx.dll", "0Harmony.dll"):
+        (game / "BepInEx/core" / name).write_bytes(name.encode())
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        Path(next(item[5:] for item in args if item.startswith("/out:"))).write_bytes(b"compiled")
+        Path(next(item[5:] for item in args if item.startswith("/pdb:"))).write_bytes(b"symbols")
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(build, "COMPILER", compiler)
+    monkeypatch.setattr(build.subprocess, "run", fake_run)
+    result = build.compile_sources([source], tmp_path / "out.dll", game=game, profile="bepinex", reference_paths=[dep], debug=True)
+    assert result["ok"] is True
+    assert any(str(game / "BepInEx/core/BepInEx.dll") in arg for arg in captured["args"])
+    assert f"/reference:{dep}" in captured["args"]
+    assert "/debug:full" in captured["args"] and "/optimize-" in captured["args"]
+
+
+def test_api_indexer_cache_tracks_compiler_and_cecil_hashes(tmp_path, monkeypatch):
+    root, game = tmp_path / "project", tmp_path / "game"
+    (root / "tools").mkdir(parents=True)
+    (root / "tools/ApiIndex.cs").write_text("source")
+    compiler = root / "compiler/csc.exe"
+    compiler.parent.mkdir()
+    compiler.write_bytes(b"compiler-v1")
+    cecil = game / "BepInEx/core/Mono.Cecil.dll"
+    cecil.parent.mkdir(parents=True)
+    cecil.write_bytes(b"cecil-v1")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        Path(next(item[5:] for item in args if item.startswith("/out:"))).write_bytes(str(len(calls)).encode())
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(build, "ROOT", root)
+    monkeypatch.setattr(build, "GAME", game)
+    monkeypatch.setattr(build, "COMPILER", compiler)
+    monkeypatch.setattr(build.subprocess, "run", fake_run)
+    first = build.build_api_indexer()
+    assert build.build_api_indexer() == first and len(calls) == 1
+    cecil.write_bytes(b"cecil-v2")
+    build.build_api_indexer()
+    assert len(calls) == 2
+    compiler.write_bytes(b"compiler-v2")
+    build.build_api_indexer()
+    assert len(calls) == 3
+
+
+def test_api_query_allows_installed_plugin_assemblies_but_rejects_outside_paths(tmp_path, monkeypatch):
+    game = tmp_path / "game"
+    allowed = game / "BepInEx/plugins/Example/Dependency.dll"
+    outside = tmp_path / "outside.dll"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_bytes(b"assembly")
+    outside.write_bytes(b"assembly")
+    monkeypatch.setattr(build, "GAME", game)
+    with pytest.raises(VamError) as error:
+        build.api_query("search", "anything", assembly_path=str(outside))
+    assert error.value.code == "invalid_path"
+    indexer = tmp_path / "ApiIndex.exe"
+    indexer.write_bytes(b"indexer")
+    monkeypatch.setattr(build, "RUNTIME", tmp_path / "runtime")
+    monkeypatch.setattr(build, "build_api_indexer", lambda: indexer)
+    monkeypatch.setattr(build.subprocess, "run", lambda *args, **kwargs: type("Result", (), {"returncode": 0, "stdout": '{"types":[{"name":"Example.Dependency","kind":"class","methods":[],"properties":[],"fields":[]}]}', "stderr": ""})())
+    result = build.api_query("search", "Dependency", assembly_path=str(allowed))
+    assert result["total"] == 1 and result["matches"][0]["type"] == "Example.Dependency"
 
 
 @pytest.mark.parametrize("package", ["../outside", "a/b", "..", "name with spaces"])
@@ -125,6 +314,50 @@ def test_host_restart_marks_unfinished_job_interrupted(tmp_path):
     assert HostJobs(tmp_path).get(job_id)["state"] == "interrupted"
 
 
+def test_stop_honors_cancellation_before_shutdown():
+    from vam_mcp.instances import stop
+    event = threading.Event()
+    event.set()
+    with pytest.raises(VamError) as error:
+        stop("vam_fixture", cancel_event=event)
+    assert error.value.code == "cancelled"
+
+
+def test_stop_honors_cancellation_before_shutdown():
+    from vam_mcp.instances import stop
+    event = threading.Event()
+    event.set()
+    with pytest.raises(VamError) as error:
+        stop("vam_fixture", cancel_event=event)
+    assert error.value.code == "cancelled"
+
+
+def test_restart_reuses_instance_identity_and_save_directory(monkeypatch, tmp_path):
+    import contextlib
+    import vam_mcp.instances as instance_module
+
+    launch = {"instance_id": "vam_fixture", "pid": 123, "instance_folder": str(tmp_path / "instance"), "saves_dir": str(tmp_path / "saves"), "process_identity": 10}
+    (tmp_path / "instance").mkdir()
+    monkeypatch.setattr(instance_module, "instances", lambda **kwargs: [{"instance_id": "vam_fixture", "instance_folder": launch["instance_folder"]}])
+    monkeypatch.setattr(instance_module, "read_json", lambda path: dict(launch))
+    stopped = []
+    monkeypatch.setattr(instance_module, "stop", lambda instance_id, **kwargs: stopped.append(instance_id))
+    monkeypatch.setattr(instance_module, "process_identity", lambda pid: None)
+    monkeypatch.setattr(instance_module.GameLease, "hold", staticmethod(lambda: contextlib.nullcontext()))
+    result = {}
+
+    def start(info, timeout_s, cancel_event):
+        result.update(info)
+        return {"ok": True, **info}
+
+    monkeypatch.setattr(instance_module, "_start_owned", start)
+    value = instance_module.restart("vam_fixture", timeout_s=30)
+    assert stopped == ["vam_fixture"]
+    assert value["instance_id"] == "vam_fixture"
+    assert value["saves_dir"] == str(tmp_path / "saves")
+    assert value["previous_process_identity"] == 10
+
+
 def test_transport_handles_native_false_and_does_not_retry():
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -159,6 +392,8 @@ def test_compile_diagnostics(tmp_path):
 
 @pytest.mark.live
 def test_real_api_index():
+    if not (build.GAME / "VaM_Data/Managed/Assembly-CSharp.dll").is_file():
+        pytest.skip("VaM_GAME_ROOT is not configured to a VaM installation")
     result = build.api_query("search", "GetAtomByUid")
     assert any("GetAtomByUid(System.String uid)" in m.get("signature", "") for m in result["matches"])
 
@@ -166,9 +401,41 @@ def test_real_api_index():
 def test_all_mcp_tools_have_json_schemas():
     from vam_mcp.server import mcp
     tools = asyncio.run(mcp.list_tools())
-    assert len(tools) == 17
-    assert {"vam_capture", "vam_test", "vam_probe", "vam_ui_action"}.issubset({t.name for t in tools})
+    assert len(tools) == 18
+    assert {"vam_capture", "vam_test", "vam_probe", "vam_ui_action", "vam_capabilities"}.issubset({t.name for t in tools})
     assert all(t.inputSchema["type"] == "object" for t in tools)
+
+
+def test_plugin_profiles_describe_build_lifecycle_and_validation():
+    from vam_mcp.profiles import plugin_capabilities
+    profiles = plugin_capabilities()["profiles"]
+    assert set(profiles) == {"mvrscript", "bepinex", "var_bundle"}
+    assert profiles["bepinex"]["deployment"] == "BepInEx/plugins/<package>"
+    assert "restart" in profiles["bepinex"]["validation"]
+    assert profiles["var_bundle"]["compiler"]["kind"] == "prebuilt_archive"
+    with pytest.raises(VamError, match="Unknown plugin profile"):
+        plugin_capabilities("unknown")
+
+
+def test_plugin_capabilities_report_missing_local_prerequisites(tmp_path):
+    from vam_mcp.profiles import plugin_capabilities
+    result = plugin_capabilities(game=tmp_path, compiler=tmp_path / "csc.exe")
+    assert result["profiles"]["mvrscript"]["available"] is False
+    assert "VaM.exe" in result["profiles"]["mvrscript"]["missing_requirements"]
+    assert result["profiles"]["var_bundle"]["available"] is True
+    assert result["profiles"]["var_bundle"]["live_validation_ready"] is False
+
+
+def test_plugin_capabilities_require_an_active_bridge_for_live_readiness(tmp_path):
+    from vam_mcp.profiles import plugin_capabilities
+    (tmp_path / "VaM.exe").write_bytes(b"game")
+    bridge = tmp_path / "BepInEx/plugins/VaMMcp/VaMMcp.Bridge.dll"
+    bridge.parent.mkdir(parents=True)
+    bridge.write_bytes(b"bridge")
+    cold = plugin_capabilities(game=tmp_path, compiler=tmp_path / "csc.exe")
+    live = plugin_capabilities(game=tmp_path, compiler=tmp_path / "csc.exe", live_instance_available=True)
+    assert cold["bridge_installed"] is True and cold["profiles"]["mvrscript"]["live_validation_ready"] is False
+    assert live["profiles"]["mvrscript"]["live_validation_ready"] is True
 
 
 def test_test_scene_does_not_autoload_source_plugins():

@@ -1,6 +1,6 @@
 # VaM MCP
 
-Windows 上的 VaM 插件开发与测试 MCP。通过 Python stdio MCP 和 BepInEx 桥接，提供 17 个工具；不会修改游戏本体程序集。
+Windows 上的 VaM 插件开发与测试 MCP。通过 Python stdio MCP 和 BepInEx 桥接，提供 18 个工具；不会修改游戏本体程序集。
 
 Windows 测试进程通过系统自带的 WMI/CIM 启动，关闭或重连 MCP 后仍保留，可用 `vam_instance(action="connect", instance_id=...)` 继续使用。停止实例需要显式调用 `stop`。
 
@@ -23,24 +23,39 @@ python -m pip install -r requirements.txt
 
 工具调用顺序：
 
-1. `vam_status` 检查环境；`vam_instance(action="start")` 返回 `host_...` 任务。
+1. `vam_capabilities` 识别插件目标；`vam_status` 检查环境；`vam_instance(action="start")` 返回 `host_...` 任务。
 2. 用 `vam_job(action="wait", job_id=...)` 等待，取得 `instance_id`。
-3. `vam_api(action="search", query=...)` 查询实际 VaM API；`action="type"` 读取签名及反编译片段。
-4. `vam_plugin(action="compile", entrypoint=...)` 检查 `.cs/.cslist`；`deploy` 指定包目录名，取得游戏相对入口。
+3. `vam_api(action="search", query=...)` 查询实际 VaM API；`action="type"` 读取签名及反编译片段。已安装插件 DLL 可用 `assembly_path` 查询。
+4. `vam_plugin(action="compile", profile="mvrscript", entrypoint=...)` 检查原生脚本；`deploy` 指定包目录名，取得游戏相对入口。
 5. `vam_plugin(action="load", instance_id=..., atom_uid=..., entrypoint=...)` 加载，返回插件槽和脚本 `storable_id`。
 6. 优先用 `vam_storable` 调用 Action 或修改参数。未注册的控件用 `vam_plugin(action="open_ui")`、`vam_ui_tree`、`vam_ui_action`。
 7. `vam_capture` 返回实际图片和本地 PNG；`vam_logs` 增量读取本次操作后的错误。
 
 每次加载、卸载、重载插件或切换场景后，重新查询 UI 句柄。多个测试实例同时存在时必须传入 `instance_id`。当前普通启动的 VaM 不会打开桥接端口；桥接仅在带专用启动标记的测试实例中启用。
 
+## 插件目标
+
+先调用 `vam_capabilities` 查看配置文件、当前游戏/编译器依赖是否齐全，以及是否可进行 live 验证。
+
+| Profile | 输入与构建 | 部署 | 生命周期与验证 |
+|---|---|---|---|
+| `mvrscript` | `.cs/.cslist`；VaM CLR 引用；C# 5；可传 `reference_paths`、`artifact_files`、`debug` | `Custom/Scripts/<package>`；资源与配置按 source root 相对路径部署 | `MVRPluginManager` 加载/热重载；参数、uGUI、截图、日志、probe |
+| `bepinex` | `.cs/.cslist`；VaM 与 BepInEx 引用；C# 5；生成 DLL，可部署 PDB、依赖和资源 | `BepInEx/plugins/<package>` | `vam_instance(action="restart")` 重启同一测试实例后，`vam_plugin(action="verify", profile="bepinex", plugin_uid=<GUID>)` 检查 Chainloader；用 `vam_logs` 检查 BepInEx 日志 |
+| `var_bundle` | 预制 `.var` ZIP 归档；不编译或制作归档 | `AddonPackages/<archive>.var` | 校验 `meta.json` 与成员路径；从 `Custom/Scripts/*.cs` 返回 VaM 包内路径候选，可原生加载/热重载，随后截图/日志/probe |
+
+显式 DLL 引用和资源路径可相对 `source_root`、VaM 根目录或绝对路径提供。部署返回 `deployment_id` 和逐文件 SHA-256 清单；`vam_plugin(action="rollback", deployment_id=...)` 仅回滚当前哈希仍与该部署相符的文件，若文件后来被改动则返回冲突。`debug=true` 启用调试编译；BepInEx DLL 部署会附带 PDB。VAR 的 `compile`/`deploy` 会返回归档内脚本候选路径，可传给 `vam_plugin(action="load", profile="var_bundle", ...)`。
+
+BepInEx 示例流程：用 `profile="bepinex"` 编译 `examples/BepInExFixture.cs` 并部署，随后 `vam_instance(action="restart", instance_id=...)`，再按源码中的 `[BepInPlugin]` GUID `codex.vam.mcp.fixture` 调用 `vam_plugin(action="verify", profile="bepinex", instance_id=..., plugin_uid=...)`。重启保留实例 ID 和 saves 目录，但会重新启动 VaM 进程；若在退出请求提交后取消，原进程仍可能继续退出。`vam_test` 也可用 `operation="bepinex"` 对加载器注册表做断言。
+
 ## 工具
 
 | 工具 | 能力 |
 |---|---|
+| `vam_capabilities` | 插件目标、工具链、打包部署、生命周期和验证能力 |
 | `vam_status` | 环境、版本、实例运行状态 |
-| `vam_instance` | 安装、启动、连接、列举、停止测试实例 |
+| `vam_instance` | 安装、启动、连接、列举、停止、重启测试实例 |
 | `vam_api` | 按实际程序集哈希缓存的类型与成员查询 |
-| `vam_plugin` | 编译、带备份部署、加载、检查、重载、卸载、打开界面 |
+| `vam_plugin` | 按 profile 构建、部署、核验、回滚或操作原生插件生命周期 |
 | `vam_scene` | 检查、新建、载入、保存原生场景 |
 | `vam_atom` | 列举、创建、克隆、移除、调整变换 |
 | `vam_storable` | 参数元数据、范围、可选值、读写、Action |
@@ -98,6 +113,8 @@ result["found"].AsBool = field != null;
 
 `VAM_GAME_ROOT` 由安装脚本写入 Codex MCP 环境。可通过 `$env:VAM_GAME_ROOT` 或 `-GameRoot` 指定本地游戏目录。更新游戏桥前停止 MCP 测试实例；更新 Python 服务后重启 Codex 的 MCP 连接。测试范围见 `VALIDATION.md`。
 
+`scripts\Test.ps1` 执行 host-only 测试时会排除 live 测试；直接运行 `pytest` 时，如果没有 VaM 程序集，API 索引测试会自动跳过。
+
 构建按源码、编译器和引用程序集哈希缓存；源码未变时可以在实例运行中重复安装。注册和卸载脚本仅更新 `mcp_servers.vam`，保留其他配置及备份。
 
 ## 运行边界
@@ -110,4 +127,4 @@ UI 操作调用真实 Unity 控件回调，检查控件存活、激活及 enable
 
 桥接使用本机 TCP、随机令牌、请求编号、串行主线程队列和可查询任务；不会自动重放断线时的写请求。启动默认 180 秒，普通操作默认 30 秒，测试默认 600 秒；等待工具每次最多等待 45 秒。取消不回滚已完成的游戏操作。实例 PID 与进程创建时间共同校验，停止操作仅针对 MCP 启动的测试实例。
 
-完整日志保存在 `runtime\instances\vam_*\events.jsonl`，增量工具保留最近 4000 条；令牌与 Bearer 头被遮盖，密码控件不返回明文值。桥接描述文件包含本机连接令牌，日常工具只返回不含令牌的状态。
+完整日志保存在 `runtime\instances\vam_*\events.jsonl`，增量工具保留最近 4000 条；重启同一测试实例时日志游标保持单调。令牌与 Bearer 头被遮盖，密码控件不返回明文值。桥接描述文件包含本机连接令牌，日常工具只返回不含令牌的状态。

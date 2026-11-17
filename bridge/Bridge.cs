@@ -52,6 +52,7 @@ namespace VaMMcp
             {
                 current = this; gameRoot = Directory.GetCurrentDirectory(); processId = System.Diagnostics.Process.GetCurrentProcess().Id;
                 Directory.CreateDirectory(instanceFolder); logPath = Path.Combine(instanceFolder, "events.jsonl");
+                logSequence = ReadLastLogSequence();
                 Application.runInBackground = true;
                 Application.logMessageReceivedThreaded += OnUnityLog;
                 bepinListener = new BridgeLogListener(this); BepInEx.Logging.Logger.Listeners.Add(bepinListener);
@@ -88,6 +89,27 @@ namespace VaMMcp
                 while (logEvents.Count > 4000) logEvents.Dequeue();
                 if (logPath != null) try { File.AppendAllText(logPath, line + "\n", new UTF8Encoding(false)); } catch (IOException) { }
             }
+        }
+
+        private long ReadLastLogSequence()
+        {
+            long latest = 0;
+            if (!File.Exists(logPath)) return latest;
+            try
+            {
+                using (StreamReader reader = new StreamReader(logPath))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        JSONClass entry = ParseObject(line);
+                        long value;
+                        if (entry != null && Int64.TryParse(Str(entry, "sequence"), out value) && value > latest) latest = value;
+                    }
+                }
+            }
+            catch (Exception) { }
+            return latest;
         }
 
         private sealed class BridgeLogListener : ILogListener

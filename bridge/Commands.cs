@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using BepInEx;
 using SimpleJSON;
 using UnityEngine;
 
@@ -16,6 +17,7 @@ namespace VaMMcp
             JSONClass a = job.Args;
             if (job.Method == "logs") { Finish(job, ReadLogs(a)); yield break; }
             if (job.Method == "status") { Finish(job, Status()); yield break; }
+            if (job.Method == "bepinex") { Finish(job, BepInExPlugins(a)); yield break; }
             if (controller == null) throw new BridgeFailure("not_ready", "SuperController has not initialized");
             switch (job.Method)
             {
@@ -47,6 +49,45 @@ namespace VaMMcp
             value["screen_width"].AsInt = Screen.width; value["screen_height"].AsInt = Screen.height;
             value["graphics_device"] = SystemInfo.graphicsDeviceName; value["run_in_background"].AsBool = Application.runInBackground;
             return value;
+        }
+
+        private static object ReflectedMember(object target, string name)
+        {
+            if (target == null) return null;
+            Type type = target as Type ?? target.GetType();
+            object instance = target is Type ? null : target;
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+            PropertyInfo property = type.GetProperty(name, flags);
+            if (property != null && property.GetIndexParameters().Length == 0) return property.GetValue(instance, null);
+            FieldInfo field = type.GetField(name, flags);
+            return field == null ? null : field.GetValue(instance);
+        }
+
+        private JSONClass BepInExPlugins(JSONClass args)
+        {
+            Type chainloader = typeof(BaseUnityPlugin).Assembly.GetType("BepInEx.Bootstrap.Chainloader");
+            object source = ReflectedMember(chainloader, "PluginInfos");
+            if (source == null) source = ReflectedMember(chainloader, "Plugins");
+            IEnumerable entries = source as IEnumerable;
+            if (entries == null) throw new BridgeFailure("unsupported", "This BepInEx runtime does not expose its loaded plugin registry");
+            string requested = Str(args, "plugin_uid");
+            JSONArray plugins = new JSONArray();
+            foreach (object entry in entries)
+            {
+                object info = ReflectedMember(entry, "Value") ?? entry;
+                object metadata = ReflectedMember(info, "Metadata");
+                if (metadata == null) continue;
+                string guid = Convert.ToString(ReflectedMember(metadata, "GUID") ?? ReflectedMember(metadata, "Guid"));
+                string name = Convert.ToString(ReflectedMember(metadata, "Name"));
+                string version = Convert.ToString(ReflectedMember(metadata, "Version"));
+                if (requested != "" && !String.Equals(requested, guid, StringComparison.OrdinalIgnoreCase)) continue;
+                JSONClass plugin = Obj(); plugin["guid"] = guid ?? ""; plugin["name"] = name ?? ""; plugin["version"] = version ?? "";
+                plugin["instance_type"] = info.GetType().FullName;
+                plugins.Add(plugin);
+            }
+            JSONClass result = Obj(); result["plugins"] = plugins; result["total"].AsInt = plugins.Count;
+            result["source"] = "BepInEx.Bootstrap.Chainloader";
+            return result;
         }
 
         private IEnumerator Scene(Job job, JSONClass a)

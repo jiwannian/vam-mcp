@@ -12,15 +12,16 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Image
 
 from . import __version__
-from .build import api_query, build_plugin, deploy_plugin
+from .build import api_query, build_plugin, deploy_plugin, rollback_deployment
 from .client import get_client, instances
 from .common import GAME, ROOT, RUNTIME, GameLease, VamError, read_json
-from .instances import install_bridge, launch, stop
+from .instances import install_bridge, launch, restart, stop
 from .jobs import JOBS
+from .profiles import plugin_capabilities
 from .testing import run_probe, run_test, wait_for
 
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
-mcp = FastMCP("VaM", instructions="Tools for local Virt-A-Mate plugin development and testing. Start a test instance with vam_instance, query real APIs with vam_api, deploy/reload with vam_plugin. Use registered parameters first; use vam_ui_tree and handles for unregistered controls. Handles expire on scene/plugin changes. Capture returns real game pixels. A successful functional test is not a visual quality judgment. All writes target the explicitly selected test instance; game files are shared. Host jobs persist results; use vam_job to poll or cancel.", log_level="WARNING")
+mcp = FastMCP("VaM", instructions="Tools for local Virt-A-Mate plugin development and testing. Call vam_capabilities to select a supported plugin profile first. Start a test instance with vam_instance, query real APIs with vam_api, and build/deploy/verify with vam_plugin. BepInEx updates require restarting the owned test instance before verification. Use registered parameters first; use vam_ui_tree and handles for uGUI controls. Handles expire on scene/plugin changes. Capture returns real game pixels; screenshots and probes cover IMGUI/custom UI. A successful functional test is not a visual quality judgment. All writes target the explicitly selected test instance; game files are shared. Host jobs persist results; use vam_job to poll or cancel.", log_level="WARNING")
 
 
 def guarded(fn):
@@ -56,8 +57,16 @@ async def vam_status(instance_id: str = "") -> dict:
 
 @mcp.tool()
 @guarded
-async def vam_instance(action: Literal["list", "start", "connect", "stop", "install"], instance_id: str = "", timeout_s: int = 180, force: bool = False) -> dict:
-    """Start an independent hidden desktop VaM using the shared game directory, connect, or stop an owned test instance. Start returns a host job."""
+async def vam_capabilities(profile: str = "") -> dict:
+    """Describe supported VaM plugin profiles, toolchains, deployment targets, lifecycle, and validation coverage."""
+    active = await asyncio.to_thread(instances, include_offline=False)
+    return plugin_capabilities(profile, live_instance_available=any(item.get("connected") for item in active))
+
+
+@mcp.tool()
+@guarded
+async def vam_instance(action: Literal["list", "start", "connect", "stop", "restart", "install"], instance_id: str = "", timeout_s: int = 180, force: bool = False) -> dict:
+    """Start, reconnect, stop, or restart an owned test instance. Restart preserves its instance id and saves directory; start/restart return host jobs."""
     if action == "list":
         return {"ok": True, "instances": await asyncio.to_thread(instances)}
     if action == "start":
@@ -65,25 +74,40 @@ async def vam_instance(action: Literal["list", "start", "connect", "stop", "inst
     if action == "install":
         return await asyncio.to_thread(install_bridge)
     if action == "stop":
-        return JOBS.start("instance_stop", lambda event, progress: stop(instance_id, force=force))
+        return JOBS.start("instance_stop", lambda event, progress: stop(instance_id, force=force, cancel_event=event))
+    if action == "restart":
+        return JOBS.start("instance_restart", lambda event, progress: restart(instance_id, timeout_s, force, event))
     return await asyncio.to_thread(game_call(instance_id, "status", {}))
 
 
 @mcp.tool()
 @guarded
-async def vam_api(action: Literal["search", "type"], query: str = "", type_name: str = "", assembly: str = "Assembly-CSharp.dll", offset: int = 0, limit: int = 30) -> dict:
-    """Search real local assembly APIs or inspect a type and optional decompiled source. Search is indexed by assembly hash. Offset is item offset for search, source line offset for type."""
-    return await asyncio.to_thread(api_query, action, query, type_name, assembly, offset, limit)
+async def vam_api(action: Literal["search", "type"], query: str = "", type_name: str = "", assembly: str = "Assembly-CSharp.dll", offset: int = 0, limit: int = 30, assembly_path: str = "") -> dict:
+    """Search managed, BepInEx, or installed plugin DLL APIs; optionally decompile a type. Index caches include assembly and indexer hashes."""
+    return await asyncio.to_thread(api_query, action, query, type_name, assembly, offset, limit, assembly_path)
 
 
 @mcp.tool()
 @guarded
-async def vam_plugin(action: Literal["compile", "deploy", "list", "inspect", "load", "reload", "unload", "open_ui"], instance_id: str = "", atom_uid: str = "", plugin_uid: str = "", entrypoint: str = "", source_root: str = "", package: str = "", script_index: int = 0, timeout_s: int = 30) -> dict:
-    """Compile .cs/.cslist with game CLR references, deploy with backups/hash manifest, or use VaM's native plugin lifecycle. Load accepts a game-relative entrypoint. Deploy requires package."""
+async def vam_plugin(action: Literal["compile", "deploy", "rollback", "verify", "list", "inspect", "load", "reload", "unload", "open_ui"], instance_id: str = "", atom_uid: str = "", plugin_uid: str = "", entrypoint: str = "", source_root: str = "", package: str = "", profile: Literal["mvrscript", "bepinex", "var_bundle"] = "mvrscript", reference_paths: list[str] | None = None, artifact_files: list[str] | None = None, debug: bool = False, deployment_id: str = "", script_index: int = 0, timeout_s: int = 30) -> dict:
+    """Build/deploy MVRScript, BepInEx, or prebuilt VAR artifacts. BepInEx verify inspects loaded Chainloader metadata; restart the owned instance after deployment. Rollback uses a deployment id."""
+    build_options = {"profile": profile, "reference_paths": reference_paths or [], "debug": debug, "artifact_files": artifact_files or []}
     if action == "compile":
-        return await asyncio.to_thread(build_plugin, entrypoint, source_root)
+        return await asyncio.to_thread(build_plugin, entrypoint, source_root, **build_options)
     if action == "deploy":
-        return await asyncio.to_thread(deploy_plugin, entrypoint, package, source_root)
+        return await asyncio.to_thread(deploy_plugin, entrypoint, package, source_root, **build_options)
+    if action == "rollback":
+        return await asyncio.to_thread(rollback_deployment, deployment_id)
+    if action == "verify" and profile == "bepinex":
+        result = await asyncio.to_thread(game_call(instance_id, "bepinex", {"plugin_uid": plugin_uid}, timeout_s))
+        if plugin_uid and not any(p.get("guid", "").lower() == plugin_uid.lower() for p in result.get("plugins", [])):
+            raise VamError("plugin_not_loaded", "BepInEx plugin GUID is not present in the loaded Chainloader registry", plugin_uid=plugin_uid, plugins=result.get("plugins", []))
+        return {"ok": True, "instance_id": instance_id, "verified": bool(plugin_uid), **result}
+    if profile == "var_bundle" and action == "load":
+        if not entrypoint.startswith("AddonPackages/") or ":/Custom/Scripts/" not in entrypoint:
+            raise VamError("invalid_value", "var_bundle load requires a script entrypoint returned by compile or deploy")
+    elif profile not in {"mvrscript", "var_bundle"}:
+        raise VamError("unsupported_action", "This lifecycle action is only available for mvrscript/var_bundle; use verify for BepInEx")
     return await asyncio.to_thread(game_call(instance_id, "plugin", {"action": action, "atom_uid": atom_uid, "plugin_uid": plugin_uid, "entrypoint": entrypoint, "script_index": script_index}, timeout_s, write=action not in {"list", "inspect"}))
 
 

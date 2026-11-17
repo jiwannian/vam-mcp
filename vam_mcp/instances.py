@@ -68,6 +68,42 @@ def base_scene():
     return {"atoms": []}, "minimal"
 
 
+def _start_owned(launch_info: dict, timeout_s: int, cancel_event=None):
+    instance_id = launch_info["instance_id"]
+    folder, saves = Path(launch_info["instance_folder"]), Path(launch_info["saves_dir"])
+    descriptor_path = folder / "bridge.json"
+    descriptor_path.unlink(missing_ok=True)
+    args = [str(GAME / "VaM.exe"), "-vrmode", "None", "-savesdir", str(saves), "-logFile", str(folder / "unity.log"), "-screen-fullscreen", "0", "-screen-width", "1280", "-screen-height", "800", "-vam-mcp", str(folder), "-vam-mcp-id", instance_id]
+    pid = launch_game_process(args)
+    identity = process_identity(pid)
+    if identity is None:
+        raise VamError("launch_failed", "VaM exited immediately")
+    launch_info.update(pid=pid, process_identity=identity, launched_at=time.time())
+    atomic_json(folder / "launch.json", launch_info)
+    deadline = time.monotonic() + min(max(timeout_s, 10), 600)
+    client = None
+    while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            terminate_owned(pid, identity)
+            raise VamError("cancelled", "Instance launch cancelled")
+        if process_identity(pid) != identity:
+            raise VamError("launch_failed", "VaM exited before bridge startup", log_path=str(folder / "unity.log"))
+        if descriptor_path.exists():
+            try:
+                client = BridgeClient(read_json(descriptor_path))
+                status = client.call("status", timeout_s=5)
+                if status["game_version"] and status["ready"]:
+                    break
+            except (VamError, ValueError, OSError):
+                pass
+        time.sleep(.5)
+    else:
+        raise VamError("startup_timeout", "VaM did not become ready; instance was left running for diagnosis", instance_id=instance_id, log_path=str(folder / "unity.log"))
+    status = client.call("scene", {"action": "load", "path": str(saves / "scene/default.json")}, timeout_s=min(max(timeout_s, 30), 600), cancel_event=cancel_event)
+    atomic_json(folder / "ready.json", status)
+    return {"ok": True, **launch_info, "status": status}
+
+
 def launch(timeout_s: int = 180, cancel_event=None):
     install_bridge()
     with GameLease.hold():
@@ -78,39 +114,34 @@ def launch(timeout_s: int = 180, cancel_event=None):
         folder.mkdir(parents=True)
         scene, origin = base_scene()
         atomic_json(saves / "scene/default.json", scene)
-        args = [str(GAME / "VaM.exe"), "-vrmode", "None", "-savesdir", str(saves), "-logFile", str(folder / "unity.log"), "-screen-fullscreen", "0", "-screen-width", "1280", "-screen-height", "800", "-vam-mcp", str(folder), "-vam-mcp-id", instance_id]
-        pid = launch_game_process(args)
-        identity = process_identity(pid)
-        if identity is None:
-            raise VamError("launch_failed", "VaM exited immediately")
-        launch_info = {"instance_id": instance_id, "pid": pid, "process_identity": identity, "instance_folder": str(folder), "game_root": str(GAME), "saves_dir": str(saves), "scene_origin": origin, "mode": "shared_game_directory", "launcher": "windows_management", "launched_at": time.time(), "python": sys.executable}
-        atomic_json(folder / "launch.json", launch_info)
-        deadline = time.monotonic() + min(max(timeout_s, 10), 600)
-        client = None
-        while time.monotonic() < deadline:
-            if cancel_event is not None and cancel_event.is_set():
-                terminate_owned(pid, identity)
-                raise VamError("cancelled", "Instance launch cancelled")
-            if process_identity(pid) != identity:
-                raise VamError("launch_failed", "VaM exited before bridge startup", log_path=str(folder / "unity.log"))
-            descriptor = folder / "bridge.json"
-            if descriptor.exists():
-                try:
-                    client = BridgeClient(read_json(descriptor))
-                    status = client.call("status", timeout_s=5)
-                    if status["game_version"] and status["ready"]:
-                        break
-                except (VamError, ValueError, OSError):
-                    pass
-            time.sleep(.5)
-        else:
-            raise VamError("startup_timeout", "VaM did not become ready; instance was left running for diagnosis", instance_id=instance_id, log_path=str(folder / "unity.log"))
-        status = client.call("scene", {"action": "load", "path": str(saves / "scene/default.json")}, timeout_s=min(max(timeout_s, 30), 600))
-        atomic_json(folder / "ready.json", status)
-        return {"ok": True, **launch_info, "status": status}
+        launch_info = {"instance_id": instance_id, "instance_folder": str(folder), "game_root": str(GAME), "saves_dir": str(saves), "scene_origin": origin, "mode": "shared_game_directory", "launcher": "windows_management", "python": sys.executable}
+        return _start_owned(launch_info, timeout_s, cancel_event)
 
 
-def stop(instance_id: str, *, force: bool = False):
+def restart(instance_id: str, timeout_s: int = 180, force: bool = False, cancel_event=None):
+    active = instances(include_offline=False)
+    selected = next((item for item in active if item["instance_id"] == instance_id), None)
+    if not selected:
+        raise VamError("not_found", "Specify an owned, live test instance")
+    launch_info = read_json(Path(selected["instance_folder"]) / "launch.json")
+    stop(instance_id, force=force, cancel_event=cancel_event)
+    old_pid, old_identity = launch_info["pid"], launch_info["process_identity"]
+    exit_deadline = time.monotonic() + 20
+    while process_identity(old_pid) == old_identity and time.monotonic() < exit_deadline:
+        time.sleep(.2)
+    if process_identity(old_pid) == old_identity:
+        raise VamError("shutdown_timeout", "Previous VaM process is still exiting; restart was not launched", instance_id=instance_id)
+    if cancel_event is not None and cancel_event.is_set():
+        raise VamError("cancelled", "Instance restart cancelled before relaunch")
+    with GameLease.hold():
+        launch_info["previous_process_identity"] = launch_info.get("process_identity")
+        launch_info["restarted_at"] = time.time()
+        return _start_owned(launch_info, timeout_s, cancel_event)
+
+
+def stop(instance_id: str, *, force: bool = False, cancel_event=None):
+    if cancel_event is not None and cancel_event.is_set():
+        raise VamError("cancelled", "Instance stop cancelled before shutdown began")
     active = instances(include_offline=False)
     selected = next((i for i in active if i["instance_id"] == instance_id), None) if instance_id else active[0] if len(active) == 1 else None
     if not selected:
@@ -118,9 +149,13 @@ def stop(instance_id: str, *, force: bool = False):
     launch_info = read_json(Path(selected["instance_folder"]) / "launch.json")
     pid, identity = launch_info["pid"], launch_info["process_identity"]
     if force:
+        if cancel_event is not None and cancel_event.is_set():
+            raise VamError("cancelled", "Instance stop cancelled before force termination")
         terminate_owned(pid, identity)
     else:
         client = get_client(selected["instance_id"])
+        if cancel_event is not None and cancel_event.is_set():
+            raise VamError("cancelled", "Instance stop cancelled before shutdown request")
         try:
             client.submit("quit", {}, timeout_s=10)
         except VamError as exc:
