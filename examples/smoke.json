@@ -1,0 +1,17 @@
+{
+  "name": "VaM native lifecycle and registered parameter smoke",
+  "steps": [
+    {"id": "status", "operation": "status", "expect": [{"path": "ready", "equals": true}]},
+    {"id": "create", "operation": "atom", "arguments": {"action": "create", "type": "Empty", "atom_uid": "McpSmoke"}},
+    {"id": "deploy", "operation": "deploy", "arguments": {"entrypoint": "examples/DevelopmentFixture.cslist", "package": "VaMMcpExamples"}},
+    {"id": "load", "operation": "plugin", "arguments": {"action": "load", "atom_uid": "McpSmoke", "entrypoint": {"$ref": "steps.deploy.entrypoint"}}},
+    {"id": "call", "operation": "storable", "arguments": {"action": "call", "atom_uid": "McpSmoke", "storable_id": {"$ref": "steps.load.scripts.0.storable_id"}, "name": "Increment"}},
+    {"id": "verify", "operation": "storable", "arguments": {"action": "get", "atom_uid": "McpSmoke", "storable_id": {"$ref": "steps.load.scripts.0.storable_id"}, "name": "count"}, "expect": [{"path": "value", "equals": 1}]},
+    {"id": "ui", "operation": "plugin", "arguments": {"action": "open_ui", "atom_uid": "McpSmoke", "plugin_uid": {"$ref": "steps.load.plugin_uid"}}},
+    {"id": "capture", "operation": "capture", "arguments": {"mode": "ui"}},
+    {"id": "unload", "operation": "plugin", "arguments": {"action": "unload", "atom_uid": "McpSmoke", "plugin_uid": {"$ref": "steps.load.plugin_uid"}}}
+  ],
+  "cleanup": [
+    {"operation": "atom", "arguments": {"action": "remove", "atom_uid": {"$ref": "steps.create.uid"}}}
+  ]
+}
